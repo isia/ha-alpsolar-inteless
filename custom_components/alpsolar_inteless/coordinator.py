@@ -7,10 +7,11 @@ import logging
 from datetime import timedelta
 from typing import Any
 
+from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import IntelessApi, IntelessApiError
-from .const import CONF_PLANT_ID, DOMAIN
+from .const import CONF_PLANT_ID, CONF_REGION, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -55,8 +56,6 @@ class IntelessCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 def coordinator_from_entry(hass: Any, entry: Any) -> IntelessCoordinator:
     """Create the API client and coordinator for a config entry."""
     from homeassistant.helpers.aiohttp_client import async_get_clientsession
-
-    from .const import CONF_PASSWORD, CONF_REGION, CONF_USERNAME
 
     api = IntelessApi(
         async_get_clientsession(hass),
