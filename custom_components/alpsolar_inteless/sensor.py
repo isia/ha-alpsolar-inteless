@@ -1,177 +1,212 @@
-import logging
-from datetime import timedelta
-import requests
+"""Sensors for verified Inteless inverter telemetry."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
 from homeassistant.components.sensor import (
-    SensorEntity,
     SensorDeviceClass,
+    SensorEntity,
+    SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.components.integration.sensor import IntegrationSensor
-from homeassistant.const import UnitOfTime
-from homeassistant.helpers.update_coordinator import (
-    DataUpdateCoordinator,
-    CoordinatorEntity,
-    UpdateFailed,
+from homeassistant.const import (
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
+    UnitOfEnergy,
+    UnitOfPower,
+    UnitOfTemperature,
 )
-from homeassistant.util import slugify
-from .const import DOMAIN, REGIONS, CONF_PLANT_ID, CONF_REGION
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-_LOGGER = logging.getLogger(__name__)
+from . import IntelessCoordinator
+from .const import DOMAIN
+from .sensor_helpers import battery_directional_power, numeric_value
 
-async def async_setup_entry(hass, entry, async_add_entities):
-    """Set up all Alpsolar sensors with dynamic, robust object handshaking."""
-    coordinator = AlpsolarCoordinator(hass, entry.data)
-    await coordinator.async_config_entry_first_refresh()
-    
-    all_entities = []
-    device_name = "Alpsolar Inverter"
-    plant_id = coordinator.config[CONF_PLANT_ID]
 
-    # 1. Instantiate Parent Power Sensors as discrete objects
-    solar_pv_sensor = AlpsolarSensor(coordinator, "pvPower", "Solar PV Power", SensorDeviceClass.POWER, "W", device_name)
-    house_load_sensor = AlpsolarSensor(coordinator, "loadOrEpsPower", "House Load", SensorDeviceClass.POWER, "W", device_name)
-    grid_power_sensor = AlpsolarSensor(coordinator, "gridOrMeterPower", "Grid Power", SensorDeviceClass.POWER, "W", device_name)
-    batt_sensor = AlpsolarSensor(coordinator, "battPower", "Battery Power", SensorDeviceClass.POWER, "W", device_name)
-    soc_sensor = AlpsolarSensor(coordinator, "soc", "Battery SOC", SensorDeviceClass.BATTERY, "%", device_name)
-    
-    # 2. Instantiate Split Battery Power Sensors
-    batt_in_sensor = BatterySplitSensor(coordinator, "in", device_name)
-    batt_out_sensor = BatterySplitSensor(coordinator, "out", device_name)
-    
-    # Add parent tracking array
-    all_entities.extend([
-        solar_pv_sensor, 
-        house_load_sensor, 
-        grid_power_sensor,
-        batt_sensor, 
-        soc_sensor, 
-        batt_in_sensor, 
-        batt_out_sensor
-    ])
+@dataclass(frozen=True, kw_only=True)
+class IntelessSensorDescription(SensorEntityDescription):
+    """Describe the source and path of a supported telemetry value."""
 
-    # 3. Dynamic Energy Sensor Creation via Direct Property Mapping
-    # This reads the live runtime .entity_id directly, remaining immune to renames.
-    energy_targets = [
-        (solar_pv_sensor, "Solar PV Power Energy"),
-        (house_load_sensor, "House Load Energy"),
-        (grid_power_sensor, "Grid Power Energy"),
-        (batt_in_sensor, "Battery Energy In"),
-        (batt_out_sensor, "Battery Energy Out"),
-    ]
+    source: str
+    path: tuple[str | int, ...]
+    transform: str | None = None
 
-    for source_sensor, energy_name in energy_targets:
-        all_entities.append(
-            AlpsolarEnergySensor(
-                hass=hass,
-                source_sensor=source_sensor,  # Pass the entire live sensor object
-                name=energy_name,
-                unique_id=f"alps_{plant_id}_{slugify(energy_name)}",
-                plant_id=plant_id,
-                device_name=device_name
-            )
+
+SENSORS: tuple[IntelessSensorDescription, ...] = (
+    IntelessSensorDescription(
+        key="pv_power", name="Solar PV Power", source="flow", path=("pvPower",),
+        device_class=SensorDeviceClass.POWER, native_unit_of_measurement=UnitOfPower.WATT,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    IntelessSensorDescription(
+        key="mppt_1_power", name="Solar MPPT 1 Power", source="flow", path=("pv", 0, "power"),
+        device_class=SensorDeviceClass.POWER, native_unit_of_measurement=UnitOfPower.WATT,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    IntelessSensorDescription(
+        key="mppt_2_power", name="Solar MPPT 2 Power", source="flow", path=("pv", 1, "power"),
+        device_class=SensorDeviceClass.POWER, native_unit_of_measurement=UnitOfPower.WATT,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    IntelessSensorDescription(
+        key="grid_power", name="Grid Power", source="flow", path=("gridOrMeterPower",),
+        device_class=SensorDeviceClass.POWER, native_unit_of_measurement=UnitOfPower.WATT,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    IntelessSensorDescription(
+        key="load_power", name="Load Power", source="flow", path=("loadOrEpsPower",),
+        device_class=SensorDeviceClass.POWER, native_unit_of_measurement=UnitOfPower.WATT,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    IntelessSensorDescription(
+        key="battery_power", name="Battery Power", source="flow", path=("battPower",),
+        device_class=SensorDeviceClass.POWER, native_unit_of_measurement=UnitOfPower.WATT,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    IntelessSensorDescription(
+        key="battery_charge_power", name="Battery Charging Power", source="flow", path=("battPower",),
+        device_class=SensorDeviceClass.POWER, native_unit_of_measurement=UnitOfPower.WATT,
+        state_class=SensorStateClass.MEASUREMENT, transform="charge_power",
+    ),
+    IntelessSensorDescription(
+        key="battery_discharge_power", name="Battery Discharging Power", source="flow", path=("battPower",),
+        device_class=SensorDeviceClass.POWER, native_unit_of_measurement=UnitOfPower.WATT,
+        state_class=SensorStateClass.MEASUREMENT, transform="discharge_power",
+    ),
+    IntelessSensorDescription(
+        key="battery_soc", name="Battery State of Charge", source="battery", path=("soc",),
+        device_class=SensorDeviceClass.BATTERY, native_unit_of_measurement="%",
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    IntelessSensorDescription(
+        key="battery_voltage", name="Battery Voltage", source="battery", path=("voltage",),
+        device_class=SensorDeviceClass.VOLTAGE, native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    IntelessSensorDescription(
+        key="battery_current", name="Battery Current", source="battery", path=("current",),
+        device_class=SensorDeviceClass.CURRENT, native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    IntelessSensorDescription(
+        key="battery_temperature", name="Battery Temperature", source="battery", path=("temp",),
+        device_class=SensorDeviceClass.TEMPERATURE, native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    IntelessSensorDescription(
+        key="battery_energy_charged", name="Battery Energy Charged Total", source="battery", path=("etotalChg",),
+        device_class=SensorDeviceClass.ENERGY, native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+    ),
+    IntelessSensorDescription(
+        key="battery_energy_discharged", name="Battery Energy Discharged Total", source="battery", path=("etotalDischg",),
+        device_class=SensorDeviceClass.ENERGY, native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+    ),
+)
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: Any,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Create one set of sensor entities for every discovered inverter."""
+    coordinator: IntelessCoordinator = entry.runtime_data
+    added_serials: set[str] = set()
+
+    def add_new_inverters() -> None:
+        new_serials = set(coordinator.data) - added_serials
+        if not new_serials:
+            return
+        added_serials.update(new_serials)
+        async_add_entities(
+            IntelessSensor(coordinator, serial, description)
+            for serial in new_serials
+            for description in SENSORS
         )
-    
-    async_add_entities(all_entities)
 
-class AlpsolarCoordinator(DataUpdateCoordinator):
-    def __init__(self, hass, config):
-        super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=timedelta(seconds=60))
-        self.config = config
+    add_new_inverters()
+    entry.async_on_unload(coordinator.async_add_listener(add_new_inverters))
 
-    async def _async_update_data(self):
-        def fetch():
-            try:
-                region_name = self.config.get(CONF_REGION, "Europe")
-                base_url = REGIONS.get(region_name, "https://euapi.inteless.com")
-                
-                login_data = {
-                    "username": self.config["username"], 
-                    "password": self.config["password"], 
-                    "grant_type": "password", 
-                    "client_id": "csp-web"
-                }
-                
-                token_r = requests.post(f"{base_url}/oauth/token", json=login_data, timeout=15)
-                token_r.raise_for_status()
-                token = token_r.json().get("data", {}).get("access_token")
-                
-                if not token:
-                    raise UpdateFailed("Failed to obtain access token from local API shard.")
-                
-                headers = {"Authorization": f"Bearer {token}"}
-                plant_id = self.config[CONF_PLANT_ID]
-                list_url = f"{base_url}/api/v1/plant/station/list"
-                
-                res = requests.get(list_url, headers=headers, timeout=15)
-                res.raise_for_status()
-                
-                stations = res.json().get("data", {}).get("list", [])
-                for station in stations:
-                    if stroke := str(station.get("plantId")) == str(plant_id):
-                        return station
-                return {}
-            except Exception as err:
-                raise UpdateFailed(f"API Error during telemetry sync: {err}")
-        return await self.hass.async_add_executor_job(fetch)
 
-class AlpsolarSensor(CoordinatorEntity, SensorEntity):
-    def __init__(self, coordinator, key, name, device_class, unit, device_name):
+class IntelessSensor(CoordinatorEntity[IntelessCoordinator], SensorEntity):
+    """A single sensor tied to an inverter device."""
+
+    entity_description: IntelessSensorDescription
+
+    def __init__(
+        self,
+        coordinator: IntelessCoordinator,
+        serial: str,
+        description: IntelessSensorDescription,
+    ) -> None:
         super().__init__(coordinator)
-        self._key = key
-        self._attr_name = name
-        self._attr_device_class = device_class
-        self._attr_native_unit_of_measurement = unit
-        self._attr_state_class = SensorStateClass.MEASUREMENT
-        self.unique_id = f"alps_{coordinator.config[CONF_PLANT_ID]}_{key.lower()}"
-        self._attr_unique_id = self.unique_id
-        self._attr_device_info = {"identifiers": {(DOMAIN, coordinator.config[CONF_PLANT_ID])}, "name": device_name}
+        self.entity_description = description
+        self._serial = serial
+        self._attr_unique_id = f"{serial}_{description.key}"
+        inverter = coordinator.data[serial]["inverter"]
+        model = inverter.get("model") or inverter.get("modelSource") or "Inteless inverter"
+        version = inverter.get("version") or {}
+        firmware = ".".join(
+            str(value) for value in (version.get("masterVer"), version.get("softVer")) if value
+        ) or None
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, serial)},
+            "manufacturer": "CHISAGE ESS",
+            "model": model,
+            "name": f"{model} ({serial})",
+            "serial_number": serial,
+            "sw_version": firmware,
+        }
 
     @property
-    def native_value(self):
-        if self.coordinator.data:
-            val = self.coordinator.data.get(self._key)
-            try: return float(val) if val is not None else 0.0
-            except: return 0.0
-        return 0.0
-
-class BatterySplitSensor(CoordinatorEntity, SensorEntity):
-    def __init__(self, coordinator, mode, device_name):
-        super().__init__(coordinator)
-        self._mode = mode
-        self._attr_name = f"Battery Power {mode.capitalize()}"
-        self._attr_device_class = SensorDeviceClass.POWER
-        self._attr_native_unit_of_measurement = "W"
-        self._attr_state_class = SensorStateClass.MEASUREMENT
-        self.unique_id = f"alps_{coordinator.config[CONF_PLANT_ID]}_batt_p_{mode}"
-        self._attr_unique_id = self.unique_id
-        self._attr_device_info = {"identifiers": {(DOMAIN, coordinator.config[CONF_PLANT_ID])}, "name": device_name}
+    def native_value(self) -> float | None:
+        """Return a numeric measurement, or None when the API omitted it."""
+        item = self.coordinator.data.get(self._serial)
+        if not item:
+            return None
+        source = item.get(self.entity_description.source)
+        value: Any = source
+        for key in self.entity_description.path:
+            if isinstance(value, dict):
+                value = value.get(key)
+            elif isinstance(value, list) and isinstance(key, int) and key < len(value):
+                value = value[key]
+            else:
+                return None
+        numeric = numeric_value(
+            value,
+            non_negative=self.entity_description.device_class == SensorDeviceClass.ENERGY,
+        )
+        if numeric is None:
+            return None
+        if self.entity_description.transform == "charge_power":
+            return battery_directional_power(numeric)[0]
+        if self.entity_description.transform == "discharge_power":
+            return battery_directional_power(numeric)[1]
+        return numeric
 
     @property
-    def native_value(self):
-        val = self.coordinator.data.get("battPower", 0)
+    def available(self) -> bool:
+        """Mark data unavailable when the cloud's inverter sample is stale."""
+        if not super().available:
+            return False
+        if self.native_value is None:
+            return False
+        inverter = self.coordinator.data.get(self._serial, {}).get("inverter", {})
+        updated = inverter.get("updateAt")
+        if not updated:
+            return True
         try:
-            val = float(val)
-            if self._mode == "in": return max(0, val)
-            else: return max(0, -val)
-        except: return 0.0
-
-class AlpsolarEnergySensor(IntegrationSensor):
-    def __init__(self, hass, source_sensor, name, unique_id, plant_id, device_name):
-        self._source_sensor = source_sensor
-        super().__init__(
-            hass=hass, 
-            integration_method="left", 
-            name=name, 
-            round_digits=2,
-            source_entity=source_sensor.entity_id, # Safely populated during registration
-            unique_id=unique_id, 
-            unit_prefix="k",
-            unit_time=UnitOfTime.HOURS, 
-            max_sub_interval=None
-        )
-        self._attr_device_info = {"identifiers": {(DOMAIN, plant_id)}, "name": device_name}
-
-    async def async_added_to_hass(self):
-        """Handle tracking fallback dynamically if entity_id strings change."""
-        self._source_entity = self._source_sensor.entity_id
-        await super().async_added_to_hass()
+            timestamp = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return True
+        return datetime.now(timezone.utc) - timestamp <= timedelta(minutes=10)

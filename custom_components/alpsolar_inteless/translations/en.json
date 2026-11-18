@@ -1,0 +1,29 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "data": {
+          "region": "Server Region",
+          "username": "Username (Email)",
+          "password": "Password",
+          "plant_id": "Plant ID"
+        }
+      },
+      "reconfigure": {
+        "data": {
+          "region": "Server Region",
+          "username": "Username (Email)",
+          "password": "Password (leave blank to keep current)",
+          "plant_id": "Plant ID"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid username or password. Check your Inteless credentials.",
+      "cannot_connect": "Could not connect to Inteless or the selected plant was not accessible."
+    },
+    "abort": {
+      "reconfigure_successful": "Reconfiguration successful"
+    }
+  }
+}
